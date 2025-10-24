@@ -1,0 +1,7 @@
+setuptools
+numpy
+pandas
+scipy
+h5py
+tqdm
+pytest

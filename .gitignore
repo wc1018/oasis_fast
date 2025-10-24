@@ -1,0 +1,10 @@
+.vscode
+.coverage
+*.code-workspace
+*.egg-info
+*.ini
+.pytest_cache
+*__pycache__*
+build/*
+temp/*
+scripts/*
