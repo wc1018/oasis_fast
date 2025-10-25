@@ -8,11 +8,8 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import fsolve
 from tqdm import tqdm
-from scipy.spatial import cKDTree
-from numba import njit
 
-
-from oasis.common import G_gravity, mkdir
+from oasis.common import G_GRAVITY, ensure_dir_exists
 from oasis.coordinates import relative_coordinates
 from oasis.minibox import load_particles, load_seeds
 
@@ -99,7 +96,6 @@ def rho_nfw_roots(
     return frac1 - frac2
 
 
-@njit
 def classify(
     rel_pos: np.ndarray,
     rel_vel: np.ndarray,
@@ -137,7 +133,7 @@ def classify(
     """
     m_pos, b_pos, m_neg, b_neg, alpha, beta, gamma = class_pars
     # Compute V200
-    v200 = G_gravity * m200 / r200
+    v200 = G_GRAVITY * m200 / r200
 
     # Compute the radius to seed_i in r200 units, and ln(v^2) in v200 units
     part_ln_vel = np.log(np.sum(np.square(rel_vel), axis=1) / v200)
@@ -167,8 +163,6 @@ def classify(
     return mask_orb
 
 
-
-
 def classify_single_mini_box(
     mini_box_id: int,
     min_num_part: int,
@@ -179,8 +173,7 @@ def classify_single_mini_box(
     padding: float = 5.0,
     fast_mass: bool = False,
     part_mass: float = None,
-    disable_tqdm: bool = False,
-    seed_range: tuple = None,
+    disable_tqdm: bool = True,
 ) -> None:
     """Runs the classifier for each seed in a mini box...
 
@@ -207,21 +200,11 @@ def classify_single_mini_box(
     None
     """
     save_path = load_path + f'run_{run_name}/mini_box_catalogues/'
-    mkdir(save_path)
+    ensure_dir_exists(save_path)
 
     # Load seeds in mini box
     pos_seed, vel_seed, hid, r200b, m200b, rs, mask_mb = \
         load_seeds(mini_box_id, boxsize, minisize, load_path, padding)
-    
-    if seed_range is not None:
-        mask_range = (m200b >= seed_range[0]) & (m200b < seed_range[1])
-        pos_seed = pos_seed[mask_range]
-        vel_seed = vel_seed[mask_range]
-        hid = hid[mask_range]
-        r200b = r200b[mask_range]
-        m200b = m200b[mask_range]
-        rs = rs[mask_range]
-        mask_mb = mask_mb[mask_range]
 
     if fast_mass and part_mass:
         min_mass = 0.5 * min_num_part * part_mass
@@ -242,7 +225,7 @@ def classify_single_mini_box(
     # Exit if there are no seeds in the mini box.
     if not any(hid):
         return None
- 
+
     # Concentration parameter and characteristic density
     deltac = characteristic_density(r200b, rs)
 
@@ -251,7 +234,7 @@ def classify_single_mini_box(
         load_particles(mini_box_id, boxsize, minisize, load_path, padding)
 
     # Load calibration parameters
-    with h5.File(load_path + 'calibration_pars_part.hdf5', 'r') as hdf:
+    with h5.File(load_path + 'calibration_pars.hdf5', 'r') as hdf:
         pars = (*hdf['pos'][()], *hdf['neg/line'][()], *hdf['neg/quad'][()])
 
     col_names = (
@@ -260,109 +243,119 @@ def classify_single_mini_box(
     )
     haloes = pd.DataFrame(columns=col_names)
 
-    tree = cKDTree(np.mod(pos_part, boxsize), boxsize=boxsize)
-    
     orb_pid, orb_hid = [], []
     n_tot_p, n_tot_s = 0, 0
     parent_id_seed = np.full(n_seeds, -1, dtype=int)
 
-    rel_pos_seed_all = pos_seed[:, None, :] - pos_seed[None, :, :]
-    rel_pos_seed_all -= np.rint(rel_pos_seed_all / boxsize) * boxsize
-
-    # compute all indices within 2*r200b for each seed using KDTree
-    idx_all = tree.query_ball_point(pos_seed, r=2*r200b, p=np.inf)
-
-    for i in tqdm(range(n_seeds), ncols=100, desc='Finding haloes', colour='green', disable=disable_tqdm):
+    for i in tqdm(range(n_seeds), ncols=100, desc='Finding haloes',
+                  colour='green', disable=disable_tqdm):
         if parent_id_seed[i] != -1:
             continue
+        # ======================================================================
+        #                           Classify particles
+        # ======================================================================
+        rel_pos_all = relative_coordinates(pos_part, pos_seed[i], boxsize)
+        rel_vel_all = vel_part - vel_seed[i]
 
-        # ------------------------------
-        # Classify particles
-        # ------------------------------
-        pos_seed_i = pos_seed[i]
-        vel_seed_i = vel_seed[i]
-        r200b_i = r200b[i]
-        m200b_i = m200b[i]
+        # Only work with free particles and within a 2*R200b cube box to speedup
+        # computations.
+        r_max = 2.0 * r200b[i]
+        mask_part = np.prod(np.abs(rel_pos_all) <= r_max, axis=1, dtype=bool)
 
-        # get indices of particles of this halo
-        idx = idx_all[i]
-        pos_part_seed = pos_part[idx]
-        vel_part_seed = vel_part[idx]
+        # Classify.
+        mask_orb = classify(rel_pos_all[mask_part], rel_vel_all[mask_part],
+                            r200b[i], m200b[i], pars)
 
-        rel_pos_all = relative_coordinates(pos_part_seed, pos_seed_i, boxsize)
-        rel_vel_all = vel_part_seed - vel_seed_i
-
-
-        mask_orb = classify(rel_pos_all, rel_vel_all, r200b_i, m200b_i, pars)
-
-        # Check if enough orbiting particles to be a halo
+        # Ignore seed if it does not have the minimum mass to be considered a
+        # halo. Early exit to avoid further computation for a non-halo seed.
         is_halo = mask_orb.sum() >= min_num_part
         if not is_halo:
             continue
 
-        # ------------------------------
-        # Classify seeds
-        # ------------------------------
-        rel_pos_seed = rel_pos_seed_all[i]  # relative positions to other seeds
-        r_max = 2.0 * r200b_i
-        mask_seed = (np.sum(rel_pos_seed[i+1:]**2, axis=1) <= r_max**2) & \
-                    (parent_id_seed[i+1:] == -1)
+        # ======================================================================
+        #                           Classify seeds
+        # ======================================================================
+        # Seeds inherit the classification from the bulk of particles within a
+        # 6D ball around it. If the fraction of orbiting particles within the
+        # ball is greater than 50%, the seed is orbtiing. The seed is infalling
+        # otherwise, and all orbiting particles within the 6D ball are also
+        # infalling.
+        # ======================================================================
+        rel_pos_seed = relative_coordinates(pos_seed, pos_seed[i], boxsize)
 
+        # Only work with less massive seeds within a 2*R200b sphere.
+        mask_seed = (np.sum(np.square(rel_pos_seed[i+1:]), axis=1) <= r_max**2) & \
+            (parent_id_seed[i+1:] == -1)
+
+        # If there are seeds in the vicinity
         n_seeds_near = mask_seed.sum()
         orb_seed = []
         if n_seeds_near > 0:
-            # Precompute information for nearby seeds
             pos_seed_near = pos_seed[i+1:][mask_seed]
             vel_seed_near = vel_seed[i+1:][mask_seed]
             deltac_seed_near = deltac[i+1:][mask_seed]
             rs_seed_near = rs[i+1:][mask_seed]
-            rel_pos_seed_near = rel_pos_seed[i+1:][mask_seed]
-            r_ij_all = np.linalg.norm(rel_pos_seed_near, axis=1)
 
-         
-            delta_pos = pos_part_seed[:, None, :] - pos_seed_near[None, :, :]
-            delta_pos -= np.rint(delta_pos / boxsize) * boxsize
-            delta_vel = vel_part_seed[:, None, :] - vel_seed_near[None, :, :]
-            rp_sq_all = np.sum(delta_pos**2, axis=2)
-            vp_sq_all = np.sum(delta_vel**2, axis=2)
-
-            orb_seed = []
             if fast_mass:
-                rel_vel_seed = vel_seed - vel_seed_i
+                rel_vel_seed = vel_seed - vel_seed[i]
                 mask_orb_sub = classify(rel_pos_seed[i+1:][mask_seed],
-                                        rel_vel_seed[i+1:][mask_seed], r200b_i,
-                                        m200b_i, pars)
+                                        rel_vel_seed[i+1:][mask_seed], r200b[i],
+                                        m200b[i], pars)
                 if mask_orb_sub.sum() > 0:
-                    orb_seed.extend(hid[i+1:][mask_seed][mask_orb_sub])
+                    for item in hid[i+1:][mask_seed][mask_orb_sub]:
+                        orb_seed.append(item)
             else:
                 j = 0
                 while is_halo and (j < n_seeds_near):
-                    # Extract radial and velocity squared arrays
-                    rp_sq = rp_sq_all[:, j]
-                    vp_sq = vp_sq_all[:, j]
-                    r_ij = r_ij_all[j]
+                    # Select particles around jth seed.
+                    rel_pos_part = relative_coordinates(pos_part[mask_part],
+                                                        pos_seed_near[j],
+                                                        boxsize)
+                    rel_vel_part = vel_part[mask_part] - vel_seed_near[j]
+                    rp_sq = np.sum(np.square(rel_pos_part), axis=1)
+                    vp_sq = np.sum(np.square(rel_vel_part), axis=1)
 
+                    # Distance from the current seed to the substructure.
+                    r_ij = np.linalg.norm(rel_pos_seed[i+1:][mask_seed][j])
+                    # Defines the search radius of the 6D ball. Distance from
+                    # the substructure where the NFW density of both objects is
+                    # equal.
                     r_ball = fsolve(
                         func=rho_nfw_roots,
+                        # Start at half the distance bewteen seeds.
                         x0=0.5*r_ij,
-                        args=(deltac[i], rs[i], deltac_seed_near[j], rs_seed_near[j], r_ij)
+                        args=(deltac[i], rs[i], deltac_seed_near[j],
+                              rs_seed_near[j], r_ij)
                     )[0]
-                    r_ball = min(r_ball, r200b[i+1:][mask_seed][j])
+                    r_ball = np.min([r_ball, r200b[i+1:][mask_seed][j]])
 
-                    v_ball_sq = 4.0 * G_gravity * m200b[i+1:][mask_seed][j] / \
-                                r200b[i+1:][mask_seed][j]
+                    # Defines the search velocity  of the 6D ball.
+                    v_ball_sq = 2**2 * G_GRAVITY * m200b[i+1:][mask_seed][j] / \
+                        r200b[i+1:][mask_seed][j]
 
+                    # Check the fraction of orbiting particles in the 6D ball
                     ball6d = (rp_sq <= r_ball**2) & (vp_sq <= v_ball_sq)
+                    # Compare to the original orbiting population.
                     frac_inside = (ball6d * mask_orb).sum() / ball6d.sum()
 
-                    f_threshold = max(0.5, 1. - np.exp(-(r_ij/r200b[i+1:][mask_seed][j])**2))
+                    # If more than half the particles in the vicinity of the
+                    # seed are orbiting, the seed is tagged as orbiting.
+                    f_threshold = np.max([
+                        0.5,
+                        1. - np.exp(-(r_ij/r200b[i+1:][mask_seed][j])**2)
+                    ])
                     if frac_inside >= f_threshold:
                         orb_seed.append(hid[i+1:][mask_seed][j])
                         mask_orb[ball6d] = True
+                    # The seed is infalling otherwise and all the particles
+                    # within the box are tagged as infalling too.
                     else:
                         mask_orb[ball6d] = False
 
+                    # Check wether seed is still a halo.
                     is_halo = mask_orb.sum() >= min_num_part
+
+                    # Next item.
                     j += 1
 
         if not is_halo:
@@ -385,7 +378,7 @@ def classify_single_mini_box(
             n_tot_p,
             n_tot_p + n_orb,
             mask_mb[i],
-            pos_seed[i] + np.mean(rel_pos_all[mask_orb], axis=0),
+            pos_seed[i] + np.mean(rel_pos_all[mask_part][mask_orb], axis=0),
             n_subs,
             parent_id_seed[i],
             n_tot_s,
@@ -394,111 +387,96 @@ def classify_single_mini_box(
         n_tot_p += n_orb
         n_tot_s += len(orb_seed)
 
-        orb_pid.append(pid[idx][mask_orb])
+        orb_pid.append(pid[mask_part][mask_orb])
         orb_hid.append(orb_seed)
 
-       
-  
     orb_pid = np.concatenate(orb_pid)
     orb_hid = np.concatenate(orb_hid)
 
-    Halo_ID = haloes['Halo_ID'].to_numpy()
-    M200b = haloes['M200b'].to_numpy()
-    R200b = haloes['R200b'].to_numpy()
-    pos = np.stack(haloes['pos'].to_numpy())
-    vel = np.stack(haloes['vel'].to_numpy())
-    cm = np.stack(haloes['cm'].to_numpy())
-    NSUBS = haloes['NSUBS'].to_numpy()
-    PID = haloes['PID'].to_numpy()
-    LIDX = haloes['LIDX'].to_numpy()
-    RIDX = haloes['RIDX'].to_numpy()
-    SLIDX = haloes['SLIDX'].to_numpy()
-    SRIDX = haloes['SRIDX'].to_numpy()
-    INMB = haloes['INMB'].to_numpy()
-
-    # Preallocate result containers
-    orb_pid_perc = []
-    orb_hid_perc = []
-    halo_records = []
-
+    # Set particles' parent halo IDs.
+    orb_pid_perc, orb_hid_perc = [], []
+    col_names = (
+        'Halo_ID', 'M200b', 'R200b', 'pos', 'vel', 'Morb', 'Norb', 'LIDX', 'RIDX',
+        'cm', 'NSUBS', 'PID', 'SLIDX', 'SRIDX'
+    )
+    haloes_perc = pd.DataFrame(columns=col_names)
     n_tot_perc = 0
     n_tot_s_perc = 0
+    for i in tqdm(range(len(haloes.index)), ncols=100, desc='Saving particles',
+                  colour='green', disable=disable_tqdm):
+        keep = haloes['INMB'][i]
+        lidx = haloes['LIDX'][i]
+        ridx = haloes['RIDX'][i]
+        slidx = haloes['SLIDX'][i]
+        sridx = haloes['SRIDX'][i]
 
-    # Use sets to speed up isin queries
-    orb_pid_seen = set()
-    orb_hid_seen = set()
+        # Select particles not orbiting anything more massive.
+        mask = np.isin(orb_pid[lidx:ridx], orb_pid[:lidx], invert=True)
+        new_orb = orb_pid[lidx:ridx][mask]
 
-    for i in tqdm(range(len(haloes)), ncols=100, desc='Saving particles (fast)',
-                    colour='green', disable=disable_tqdm):
-
-        # if not INMB[i]:
-        #     continue
-
-        lidx, ridx = LIDX[i], RIDX[i]
-        slidx, sridx = SLIDX[i], SRIDX[i]
-
-        # Use sets to speed up isin queries
-        pid_range = orb_pid[lidx:ridx]
-        new_orb = [p for p in pid_range if p not in orb_pid_seen]
-        orb_pid_seen.update(new_orb)
-
-        hid_range = orb_hid[slidx:sridx]
-        new_orb_s = [h for h in hid_range if h not in orb_hid_seen]
-        orb_hid_seen.update(new_orb_s)
+        # Select seeds not orbiting anything more massive.
+        mask = np.isin(orb_hid[slidx:sridx], orb_hid[:slidx], invert=True)
+        new_orb_s = orb_hid[slidx:sridx][mask]
 
         n_orb = len(new_orb)
         n_orb_s = len(new_orb_s)
+        if n_orb >= min_num_part and keep:
+            orb_pid_perc.append(new_orb)
+            orb_hid_perc.append(new_orb_s)
 
-        if (n_orb >= min_num_part) and INMB[i]:
-            orb_pid_perc.append(np.array(new_orb, dtype=pid.dtype))
-            orb_hid_perc.append(np.array(new_orb_s, dtype=hid.dtype))
-
-            halo_records.append((
-                Halo_ID[i], M200b[i], R200b[i], pos[i], vel[i],
-                n_orb * part_mass, n_orb,
-                n_tot_perc, n_tot_perc + n_orb,
-                cm[i], NSUBS[i], PID[i],
-                n_tot_s_perc, n_tot_s_perc + n_orb_s
-            ))
-
+            haloes_perc.loc[len(haloes_perc.index)] = [
+                haloes['Halo_ID'][i],
+                haloes['M200b'][i],
+                haloes['R200b'][i],
+                haloes['pos'][i],
+                haloes['vel'][i],
+                n_orb * part_mass,
+                n_orb,
+                n_tot_perc,
+                n_tot_perc + n_orb,
+                haloes['cm'][i],
+                haloes['NSUBS'][i],
+                haloes['PID'][i],
+                n_tot_s_perc,
+                n_tot_s_perc + n_orb_s
+            ]
             n_tot_perc += n_orb
             n_tot_s_perc += n_orb_s
 
-    # Concatenate particle and seed arrays
     orb_pid_perc = np.concatenate(orb_pid_perc)
     orb_hid_perc = np.concatenate(orb_hid_perc)
+    # ==========================================================================
+    #                           Save catalogue
+    # ==========================================================================
+    # Exit if no haloes were found in this mini box.
+    if len(haloes_perc.index) < 1:
+        return None
 
-    # Create halo dataframe
-    col_names = (
-        'Halo_ID', 'M200b', 'R200b', 'pos', 'vel', 'Morb', 'Norb',
-        'LIDX', 'RIDX', 'cm', 'NSUBS', 'PID', 'SLIDX', 'SRIDX'
-    )
-    haloes_perc = pd.DataFrame(halo_records, columns=col_names)
-
-
+    # Save into file
     dtypes = (
         np.uint32, np.float32, np.float32, np.float32, np.float32, np.float32,
-        np.uint32, np.uint32, np.uint32, np.float32, np.uint16, np.int32,
+        np.uint32, np.uint32, np.uint32, np.float32, np.uint16, np.int32, 
         np.uint32, np.uint32
     )
-
-    with h5.File(f'{save_path}/{mini_box_id}.hdf5', 'w') as hdf:
+    with h5.File(save_path + f'{mini_box_id}.hdf5', 'w') as hdf:
         # Halo catalogue
-        for i, key in enumerate(col_names):
-            values = haloes_perc[key].values
-            data = np.stack(values) if key in ['pos', 'vel', 'cm'] else values
+        for i, key in enumerate(haloes_perc.columns):
+            if key in ['pos', 'vel', 'cm']:
+                data = np.stack(haloes_perc[key].values)
+            else:
+                data = haloes_perc[key].values
             hdf.create_dataset(f'halo/{key}', data=data, dtype=dtypes[i])
 
         # Particles
-        hdf.create_dataset('memb/PID', data=orb_pid_perc, dtype=pid.dtype)
+        hdf.create_dataset('memb/PID', data=orb_pid_perc,
+                           dtype=np.dtype(pid[0]))
 
         # Seeds
-        hdf.create_dataset('memb/Halo_ID', data=orb_hid_perc, dtype=hid.dtype)
-
+        hdf.create_dataset('memb/Halo_ID', data=orb_hid_perc,
+                           dtype=np.dtype(hid[0]))
 
     return None
 
-    
 
 def run_orbiting_mass_assignment(
     load_path: str,
@@ -511,7 +489,6 @@ def run_orbiting_mass_assignment(
     part_mass: float = None,
     n_threads: int = None,
     cleanup: bool = False,
-    seed_range: tuple = None
 ) -> None:
     """Generates a halo catalogue using the kinetic mass criterion to classify
     particles into orbiting or infalling.
@@ -542,7 +519,7 @@ def run_orbiting_mass_assignment(
     """
     # Create directory if it does not exist
     save_path = load_path + f'run_{run_name}/mini_box_catalogues/'
-    mkdir(save_path)
+    ensure_dir_exists(save_path)
 
     # Number of miniboxes
     n_mini_boxes = np.int_(np.ceil(boxsize / minisize))**3
@@ -552,7 +529,7 @@ def run_orbiting_mass_assignment(
     func = partial(classify_single_mini_box, min_num_part=min_num_part,
                    boxsize=boxsize, load_path=load_path, minisize=minisize,
                    padding=padding, run_name=run_name, fast_mass=fast_mass,
-                   part_mass=part_mass, disable_tqdm=True, seed_range=seed_range)
+                   part_mass=part_mass, disable_tqdm=True)
     
     with Pool(n_threads) as pool, \
         tqdm(total=n_mini_boxes, colour="green", ncols=100,
@@ -645,5 +622,4 @@ def run_orbiting_mass_assignment(
     return None
 
 
-if __name__ == '__main__':
-    pass
+###
